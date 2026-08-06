@@ -20,6 +20,7 @@
 #include "base/task/sequenced_task_runner.h"
 #include "base/test/bind.h"
 #include "base/test/scoped_feature_list.h"
+#include "base/test/test_future.h"
 #include "base/test/values_test_util.h"
 #include "base/time/time.h"
 #include "build/build_config.h"
@@ -1720,6 +1721,154 @@ IN_PROC_BROWSER_TEST_F(WebAuthnActorBrowserTest,
       "webauthn: OK",
       content::EvalJs(browser()->tab_strip_model()->GetActiveWebContents(),
                       kGetAssertionCredID1234));
+}
+
+// Reproduction test for Use-After-Free in AuthenticatorRequestDialogController
+// (crbug.com/522566295).
+class WebAuthnUAFReproductionTest
+    : public WebAuthnBrowserTest,
+      public ChromeAuthenticatorRequestDelegate::TestObserver,
+      public AuthenticatorRequestDialogModel::Observer {
+ public:
+  WebAuthnUAFReproductionTest() {
+#if BUILDFLAG(IS_WIN)
+    win_api_.set_available(false);
+#endif
+  }
+  ~WebAuthnUAFReproductionTest() override = default;
+
+  // ChromeAuthenticatorRequestDelegate::TestObserver:
+  void Created(ChromeAuthenticatorRequestDelegate* delegate) override {
+    delegate_ = delegate;
+    model_ = delegate_->dialog_model();
+    model_->AddObserver(this);
+  }
+
+  void UIShown(ChromeAuthenticatorRequestDelegate* delegate) override {
+    delegate_shown_future_.SetValue(delegate);
+  }
+
+  void OnDestroy(ChromeAuthenticatorRequestDelegate* delegate) override {
+    delegate_ = nullptr;
+  }
+
+  // AuthenticatorRequestDialogModel::Observer:
+  void OnStepTransition() override {
+    if (model_ &&
+        (model_->step() == AuthenticatorRequestDialogModel::Step::kClosed ||
+         model_->step() ==
+             AuthenticatorRequestDialogModel::Step::kPlatformAuthenticator)) {
+      DeleteWebContents();
+    }
+  }
+
+  void OnModelDestroyed(AuthenticatorRequestDialogModel* model) override {
+    if (model_ == model) {
+      model_ = nullptr;
+    }
+  }
+
+  void DeleteWebContents() {
+    if (web_contents_deleted_) {
+      return;
+    }
+    web_contents_deleted_ = true;
+    auto* tab_strip_model = browser()->tab_strip_model();
+    int active_index = tab_strip_model->active_index();
+    tab_strip_model->DetachAndDeleteWebContentsAt(active_index);
+  }
+
+  void SetUpOnMainThread() override {
+    WebAuthnBrowserTest::SetUpOnMainThread();
+    ChromeAuthenticatorRequestDelegate::SetGlobalObserverForTesting(this);
+  }
+
+  void TearDownOnMainThread() override {
+    if (model_) {
+      model_->RemoveObserver(this);
+    }
+    ChromeAuthenticatorRequestDelegate::SetGlobalObserverForTesting(nullptr);
+    WebAuthnBrowserTest::TearDownOnMainThread();
+  }
+
+  raw_ptr<ChromeAuthenticatorRequestDelegate> delegate_ = nullptr;
+  raw_ptr<AuthenticatorRequestDialogModel> model_ = nullptr;
+  base::test::TestFuture<ChromeAuthenticatorRequestDelegate*>
+      delegate_shown_future_;
+  bool web_contents_deleted_ = false;
+#if BUILDFLAG(IS_WIN)
+  device::FakeWinWebAuthnApi win_api_;
+  device::WinWebAuthnApi::ScopedOverride win_webauthn_api_override_{&win_api_};
+#endif
+};
+
+IN_PROC_BROWSER_TEST_F(WebAuthnUAFReproductionTest, CancelUAF) {
+  ASSERT_TRUE(ui_test_utils::NavigateToURL(
+      browser(), https_server_.GetURL("www.example.com", "/title1.html")));
+
+  content::WebContents* web_contents =
+      browser()->tab_strip_model()->GetActiveWebContents();
+
+  // Trigger WebAuthn flow asynchronously
+  content::ExecuteScriptAsync(web_contents, R"(
+    navigator.credentials.create({
+      publicKey: {
+        challenge: new Uint8Array([1, 2, 3, 4]),
+        rp: { name: "Example" },
+        user: {
+          id: new Uint8Array([1, 2, 3, 4]),
+          name: "test",
+          displayName: "test"
+        },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        timeout: 60000
+      }
+    });
+  )");
+
+  ASSERT_TRUE(delegate_shown_future_.Wait());
+  ASSERT_TRUE(delegate_);
+  ASSERT_TRUE(delegate_->dialog_controller());
+
+  // Force controller step to an error state where is_request_complete() is true
+  delegate_->dialog_controller()->SetCurrentStepForTesting(
+      AuthenticatorRequestDialogModel::Step::kKeyNotRegistered);
+
+  // Trigger UAF
+  delegate_->dialog_controller()->CancelAuthenticatorRequest();
+}
+
+IN_PROC_BROWSER_TEST_F(WebAuthnUAFReproductionTest, HideDialogUAF) {
+  ASSERT_TRUE(ui_test_utils::NavigateToURL(
+      browser(), https_server_.GetURL("www.example.com", "/title1.html")));
+
+  content::WebContents* web_contents =
+      browser()->tab_strip_model()->GetActiveWebContents();
+
+  // Trigger WebAuthn flow asynchronously
+  content::ExecuteScriptAsync(web_contents, R"(
+    navigator.credentials.create({
+      publicKey: {
+        challenge: new Uint8Array([1, 2, 3, 4]),
+        rp: { name: "Example" },
+        user: {
+          id: new Uint8Array([1, 2, 3, 4]),
+          name: "test",
+          displayName: "test"
+        },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        timeout: 60000
+      }
+    });
+  )");
+
+  ASSERT_TRUE(delegate_shown_future_.Wait());
+  ASSERT_TRUE(delegate_);
+  ASSERT_TRUE(delegate_->dialog_controller());
+
+  // Trigger UAF
+  delegate_->dialog_controller()->HideDialogAndDispatchToPlatformAuthenticator(
+      std::nullopt);
 }
 
 }  // namespace

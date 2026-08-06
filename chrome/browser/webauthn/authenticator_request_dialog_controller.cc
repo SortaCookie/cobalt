@@ -601,8 +601,15 @@ void AuthenticatorRequestDialogController::CancelAuthenticatorRequest() {
     return;
   }
 
+  // SetCurrentStep(Step::kClosed) can synchronously destroy the hosting
+  // WebContents and therefore `this`. See crbug.com/522566295.
+  base::WeakPtr<AuthenticatorRequestDialogController> weak_this =
+      weak_factory_.GetWeakPtr();
   if (is_request_complete()) {
     SetCurrentStep(Step::kClosed);
+  }
+  if (!weak_this) {
+    return;
   }
 
   for (auto& observer : model_->observers) {
@@ -969,7 +976,12 @@ bool AuthenticatorRequestDialogController::StartGuidedFlowForHint(
 void AuthenticatorRequestDialogController::
     HideDialogAndDispatchToPlatformAuthenticator(
         std::optional<AuthenticatorType> type) {
+  base::WeakPtr<AuthenticatorRequestDialogController> weak_this =
+      weak_factory_.GetWeakPtr();
   SetCurrentStep(Step::kPlatformAuthenticator);
+  if (!weak_this) {
+    return;
+  }
 
   std::vector<AuthenticatorReference>& authenticators =
       ephemeral_state_.saved_authenticators_.authenticator_list();
@@ -2468,7 +2480,12 @@ AuthenticatorRequestDialogController::GetRenderFrameHost() const {
 }
 
 void AuthenticatorRequestDialogController::StartPasskeyUpgradeRequest() {
+  base::WeakPtr<AuthenticatorRequestDialogController> weak_this =
+      weak_factory_.GetWeakPtr();
   SetCurrentStep(Step::kPasskeyUpgrade);
+  if (!weak_this) {
+    return;
+  }
 
   if (!enclave_request_callback_) {
     RecordPasskeyUpgradeResultHistogram(PasskeyUpgradeResult::kGpmDisabled);
